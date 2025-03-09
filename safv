@@ -1,1 +1,429 @@
+local Rayfield = loadstring(game:HttpGet('https://raw.githubusercontent.com/TheQuackKH/Quack/main/source.lua'))()
 
+local Window = Rayfield:CreateWindow({
+    Name = "Bot Controller",
+    Icon = 0,
+    LoadingTitle = "Bot Controller",
+    LoadingSubtitle = "by TheQuack",
+    Theme = "Default",
+    DisableRayfieldPrompts = true,
+    DisableBuildWarnings = true,
+    ConfigurationSaving = {
+       Enabled = true,
+       FolderName = nil,
+       FileName = "Help Me"
+    },
+    Discord = {
+       Enabled = false,
+       Invite = "noinvitelink",
+       RememberJoins = true
+    },
+    KeySystem = false,
+    KeySettings = {
+       Title = "Untitled",
+       Subtitle = "Key System",
+       Note = "No method of obtaining the key is provided",
+       FileName = "Key",
+       SaveKey = true,
+       GrabKeyFromSite = false,
+       Key = {"Hello"}
+    }
+})
+
+-- Services
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+local UserInputService = game:GetService("UserInputService")
+local GuiService = game:GetService("GuiService")
+
+-- Variables
+local player = Players.LocalPlayer
+local character = player.Character or player.CharacterAdded:Wait()
+local humanoid = character:WaitForChild("Humanoid")
+local targetPart = nil
+local isRunning = false
+local showTargetDistance = false
+local currentDistance = 0
+local lastUpdate = 0
+local updateInterval = 0.2
+local ediblesFolder = nil
+local cachedEdibles = {}
+local lastCacheUpdate = 0
+local cacheUpdateInterval = 1
+local searchDistance = 150
+local lastPosition = Vector3.new(0, 0, 0)
+local moveDirection = Vector3.new(1, 0, 0)
+local lastGuiCheck = 0
+local guiCheckInterval = 0.1
+local lastCleanup = 0
+local cleanupInterval = 5
+local returnButton = nil
+local connections = {}
+local moveConnection = nil
+local updateConnection = nil
+local deathConnection = nil
+local distanceGui = nil
+local distanceThreshold = 50 -- Maximum distance to go for edibles
+
+-- Function to cleanup connections
+local function cleanupConnections()
+    -- Disconnect all stored connections
+    for _, connection in ipairs(connections) do
+        if connection and connection.Connected then
+            connection:Disconnect()
+        end
+    end
+    
+    -- Clear specific connections
+    if moveConnection and moveConnection.Connected then
+        moveConnection:Disconnect()
+    end
+    if updateConnection and updateConnection.Connected then
+        updateConnection:Disconnect()
+    end
+    if deathConnection and deathConnection.Connected then
+        deathConnection:Disconnect()
+    end
+    
+    -- Remove distance GUI if it exists
+    if distanceGui then
+        distanceGui:Destroy()
+        distanceGui = nil
+    end
+    
+    -- Clear tables and references
+    table.clear(connections)
+    table.clear(cachedEdibles)
+    moveConnection = nil
+    updateConnection = nil
+    deathConnection = nil
+    returnButton = nil
+    ediblesFolder = nil
+    targetPart = nil
+end
+
+-- Function to create or update distance GUI
+local function updateDistanceGui()
+    if not showTargetDistance or not targetPart or not targetPart.Parent then
+        if distanceGui then
+            distanceGui:Destroy()
+            distanceGui = nil
+        end
+        return
+    end
+    
+    if not distanceGui then
+        -- Create new BillboardGui
+        distanceGui = Instance.new("BillboardGui")
+        distanceGui.Name = "DistanceGui"
+        distanceGui.AlwaysOnTop = true
+        distanceGui.Size = UDim2.new(0, 100, 0, 40)
+        distanceGui.StudsOffset = Vector3.new(0, 2, 0)
+        
+        -- Create distance text label
+        local distanceLabel = Instance.new("TextLabel")
+        distanceLabel.Name = "DistanceLabel"
+        distanceLabel.Size = UDim2.new(1, 0, 1, 0)
+        distanceLabel.BackgroundTransparency = 1
+        distanceLabel.TextColor3 = Color3.new(1, 1, 1)
+        distanceLabel.TextStrokeTransparency = 0
+        distanceLabel.TextStrokeColor3 = Color3.new(0, 0, 0)
+        distanceLabel.Font = Enum.Font.GothamBold
+        distanceLabel.TextScaled = true
+        distanceLabel.Parent = distanceGui
+    end
+    
+    -- Update GUI position and text
+    distanceGui.Parent = targetPart
+    distanceGui.DistanceLabel.Text = currentDistance .. " studs"
+end
+
+-- Function to perform periodic cleanup
+local function periodicCleanup()
+    local currentTime = tick()
+    if currentTime - lastCleanup < cleanupInterval then return end
+    lastCleanup = currentTime
+    
+    -- Clear invalid references
+    if targetPart and not targetPart.Parent then
+        targetPart = nil
+    end
+    
+    -- Remove invalid cached edibles
+    for i = #cachedEdibles, 1, -1 do
+        if not cachedEdibles[i].Parent then
+            table.remove(cachedEdibles, i)
+        end
+    end
+    
+    -- Force cleanup if cache is too large
+    if #cachedEdibles > 30 then
+        table.clear(cachedEdibles)
+    end
+end
+
+-- Function to get character's current facing direction
+local function getCharacterDirection()
+    if character and character:FindFirstChild("HumanoidRootPart") then
+        return character.HumanoidRootPart.CFrame.LookVector
+    end
+    return Vector3.new(1, 0, 0)
+end
+
+-- Function to update edibles cache with memory optimization
+local function updateEdiblesCache()
+    local currentTime = tick()
+    if currentTime - lastCacheUpdate < cacheUpdateInterval then return end
+    lastCacheUpdate = currentTime
+    
+    -- Clear old cache
+    table.clear(cachedEdibles)
+    
+    -- Get edibles folder
+    if not ediblesFolder then
+        ediblesFolder = workspace:FindFirstChild("Edibles")
+        if not ediblesFolder then return end
+    end
+    
+    -- Get character position once
+    local rootPart = character:FindFirstChild("HumanoidRootPart")
+    if not rootPart then return end
+    local charPos = rootPart.Position
+    
+    -- Cache only nearby edibles
+    for _, edible in ipairs(ediblesFolder:GetChildren()) do
+        if edible:IsA("BasePart") or edible:IsA("Model") then
+            local ediblePos = (edible:IsA("Model") and edible:GetPivot().Position) or edible.Position
+            local distance = (ediblePos - charPos).Magnitude
+            if distance <= searchDistance then
+                cachedEdibles[#cachedEdibles + 1] = edible
+            end
+            
+            -- Break if we have too many edibles cached
+            if #cachedEdibles >= 50 then break end
+        end
+    end
+end
+
+-- Function to find the nearest target
+local function findNearestTarget()
+    if not character:FindFirstChild("HumanoidRootPart") then return nil, math.huge end
+    
+    local nearestPart = nil
+    local shortestDistance = math.huge
+    local characterPos = character.HumanoidRootPart.Position
+    
+    -- Use cached edibles
+    for _, edible in ipairs(cachedEdibles) do
+        if edible.Parent then  -- Check if edible still exists
+            local ediblePos = (edible:IsA("Model") and edible:GetPivot().Position) or edible.Position
+            local distance = (ediblePos - characterPos).Magnitude
+            
+            -- Check distance threshold
+            if distance < distanceThreshold and distance < shortestDistance then
+                shortestDistance = distance
+                nearestPart = edible
+            end
+        end
+    end
+    
+    return nearestPart, shortestDistance
+end
+
+-- Function to move forward
+local function moveForward()
+    if not character:FindFirstChild("HumanoidRootPart") then return end
+    
+    -- Use character's current facing direction
+    moveDirection = getCharacterDirection()
+    
+    -- Always move forward
+    local currentPos = character.HumanoidRootPart.Position
+    humanoid:MoveTo(currentPos + moveDirection * 20)
+end
+
+-- Function to move towards target
+local function moveTowardsTarget()
+    if not character:FindFirstChild("HumanoidRootPart") then return end
+    
+    if targetPart and targetPart.Parent then
+        local targetPos = (targetPart:IsA("Model") and targetPart:GetPivot().Position) or targetPart.Position
+        local currentPos = character.HumanoidRootPart.Position
+        
+        -- Calculate direction to target
+        moveDirection = (targetPos - currentPos).Unit
+        
+        -- Move towards target
+        humanoid:MoveTo(currentPos + moveDirection * 20)
+    else
+        moveForward() -- Fallback to moving forward if no target
+    end
+end
+
+-- Function to handle death and auto-return
+local function setupDeathHandler()
+    -- Clean up any existing death handler connections
+    if deathConnection and deathConnection.Connected then
+        deathConnection:Disconnect()
+        deathConnection = nil
+    end
+    
+    -- Connect to character added event to set up new character
+    local charAddedConn = player.CharacterAdded:Connect(function(newCharacter)
+        character = newCharacter
+        humanoid = character:WaitForChild("Humanoid")
+        local rootPart = character:WaitForChild("HumanoidRootPart")
+        if rootPart then
+            lastPosition = rootPart.Position
+            moveDirection = getCharacterDirection()
+        end
+    end)
+    table.insert(connections, charAddedConn)
+    
+    -- Check for death screen and click "To Lobby" button
+    deathConnection = RunService.Heartbeat:Connect(function()
+        if not isRunning then return end
+        
+        local currentTime = tick()
+        if currentTime - lastGuiCheck < guiCheckInterval then return end
+        lastGuiCheck = currentTime
+        
+        -- Try to get the button using exact path
+        local success, button = pcall(function()
+            return player.PlayerGui.DeathGui.Frame.UI.ReturnLobbyButton
+        end)
+        
+        if success and button and button.Parent then
+            task.spawn(function()
+                -- Try multiple methods to click
+                local clickMethods = {
+                    function() 
+                        local event = button:FindFirstChild("MouseButton1Click")
+                        if event then event:Fire() end
+                    end,
+                    function()
+                        local event = button:FindFirstChild("Activated")
+                        if event then event:Fire() end
+                    end,
+                    function()
+                        if typeof(button.Activate) == "function" then
+                            button:Activate()
+                        end
+                    end,
+                    function()
+                        if typeof(button.ClickButton) == "function" then
+                            button:ClickButton()
+                        end
+                    end
+                }
+                
+                -- Try each method with a small delay
+                for _, method in ipairs(clickMethods) do
+                    pcall(method)
+                    task.wait(0.1)
+                end
+            end)
+            table.clear(cachedEdibles)
+        end
+    end)
+    table.insert(connections, deathConnection)
+end
+
+-- Create main tab
+local Tab = Window:CreateTab("Controls", nil)
+
+-- Distance Label (always visible)
+local DistanceLabel = Tab:CreateLabel("Distance to target: N/A")
+
+-- Show distance toggle
+local DistanceToggle = Tab:CreateToggle({
+    Name = "Show Distance Above Target",
+    CurrentValue = false,
+    Flag = "ShowDistanceToggle",
+    Callback = function(Value)
+        showTargetDistance = Value
+        if not Value and distanceGui then
+            distanceGui:Destroy()
+            distanceGui = nil
+        end
+    end
+})
+
+-- Auto collect toggle with built-in optimizations
+local Toggle = Tab:CreateToggle({
+    Name = "Auto Collect Edibles",
+    CurrentValue = false,
+    Flag = "AutoCollectToggle",
+    Callback = function(Value)
+        -- Ensure we clean up before changing state
+        cleanupConnections()
+        isRunning = Value
+        
+        if Value then
+            -- Set up initial state
+            setupDeathHandler()
+            if character:FindFirstChild("HumanoidRootPart") then
+                lastPosition = character.HumanoidRootPart.Position
+                moveDirection = getCharacterDirection()
+            end
+            
+            -- Start the continuous movement loop
+            moveConnection = RunService.Heartbeat:Connect(function()
+                if not isRunning then return end
+                
+                -- Always try to move
+                if character:FindFirstChild("HumanoidRootPart") then
+                    if targetPart and targetPart.Parent then
+                        moveTowardsTarget()
+                    else
+                        moveForward()
+                    end
+                end
+            end)
+            
+            -- Start the update loop (separate from movement)
+            updateConnection = RunService.Heartbeat:Connect(function()
+                if not isRunning then return end
+                
+                local currentTime = tick()
+                if currentTime - lastUpdate < updateInterval then return end
+                lastUpdate = currentTime
+                
+                -- Run periodic cleanup
+                periodicCleanup()
+                
+                -- Skip updates if character is not ready
+                if not character:FindFirstChild("HumanoidRootPart") then return end
+                
+                -- Update target and cache
+                updateEdiblesCache()
+                local newTarget, distance = findNearestTarget()
+                targetPart = newTarget
+                
+                -- Update distance displays
+                if targetPart then
+                    currentDistance = math.floor(distance)
+                    DistanceLabel:Set("Distance to target: " .. currentDistance .. " studs")
+                    updateDistanceGui()
+                else
+                    DistanceLabel:Set("No target found - Exploring")
+                    if distanceGui then
+                        distanceGui:Destroy()
+                        distanceGui = nil
+                    end
+                end
+            end)
+            
+            -- Store connections
+            table.insert(connections, moveConnection)
+            table.insert(connections, updateConnection)
+        else
+            DistanceLabel:Set("Distance to target: N/A")
+            if distanceGui then
+                distanceGui:Destroy()
+                distanceGui = nil
+            end
+        end
+    end
+})
